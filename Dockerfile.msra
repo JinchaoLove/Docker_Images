@@ -1,0 +1,46 @@
+FROM mcr.microsoft.com/azureml/o16n-base/python-assets:20220331.v12 AS inferencing-assets
+# FROM jinchaolove/dl:conda3-cuda10.2-cudnn8-ubuntu18.04
+# FROM jinchaolove/dl:conda3-cuda11.3-cudnn8-ubuntu18.04
+FROM jinchaolove/dl:conda3-cuda11.6-cudnn8-ubuntu20.04
+
+# Inference: copy logging utilities, nginx and rsyslog configuration files, IOT server binary, etc.
+COPY --from=inferencing-assets /artifacts /var/
+RUN /var/requirements/install_system_requirements.sh && \
+    cp /var/configuration/rsyslog.conf /etc/rsyslog.conf && \
+    cp /var/configuration/nginx.conf /etc/nginx/sites-available/app && \
+    ln -s /etc/nginx/sites-available/app /etc/nginx/sites-enabled/app && \
+    rm -f /etc/nginx/sites-enabled/default
+ENV SVDIR=/var/runit \
+    WORKER_TIMEOUT=300
+
+# Modified from Microsoft Singularity Installer (20220712T091927781)
+RUN wget -q https://packages.microsoft.com/config/ubuntu/$(lsb_release -r | awk '{print $2}')/packages-microsoft-prod.deb && \
+    dpkg -i packages-microsoft-prod.deb && \
+    # rm -rf packages-microsoft-prod.deb && \
+    apt-get -qq update && \
+    apt-get -qq install -y --allow-downgrades \
+        blobfuse python-pip-whl python3-distutils python3-lib2to3 python3-protobuf python3-venv python3.8-venv && \
+    apt-get clean -y && \
+    apt-get autoremove -y && \
+    rm -rf /var/lib/apt/lists/*
+
+# self-designed env
+RUN CUDA_VERSION=`nvcc -V | grep release | awk '{print $NF}' | tr -d '.' | cut -b 2-4` && \
+    pip install --no-cache-dir --extra-index-url https://download.pytorch.org/whl/cu${CUDA_VERSION} \
+        # torch
+        torch==1.12.1+cu${CUDA_VERSION} torchaudio==0.12.1+cu${CUDA_VERSION} \
+        # azure
+        applicationinsights supervisor virtualenv azure-storage-blob azureml-core azureml-dataprep \
+        # self-job-env
+        hydra_core joblib jupyter librosa numpy pandas pytorch_lightning pyyaml regex scikit_learn scipy soundfile tqdm transformers wandb
+
+# nccl-tests
+RUN cd /tmp && \
+    git clone https://github.com/NVIDIA/nccl-tests.git && \
+    cd nccl-tests && \
+    make -s -j$(nproc) && \
+    # nccl
+    ./build/all_reduce_perf -g $(nvidia-smi --query-gpu=name --format=csv,noheader | wc -l) && \
+    # open-mpi
+    mpirun --allow-run-as-root -np 2 ./build/all_reduce_perf -g $(nvidia-smi --query-gpu=name --format=csv,noheader | wc -l) && \
+    rm -rf /tmp/nccl-tests
